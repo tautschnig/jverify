@@ -851,6 +851,24 @@ public class JavaToLaurelCompiler {
         }
 
         private StmtExpr convertBinary(JCTree.JCBinary binary, Map<String, String> renames) {
+            // Handle `x == null` / `x != null` before recursing into
+            // operand conversion: in JVerify's array-as-map model there
+            // is no null, so reference comparisons against null
+            // collapse to a boolean constant. This matches the
+            // intended caller semantics (callers pass real arrays,
+            // never null) and keeps the BOT-typed literal off the
+            // convertLiteral hot path.
+            if (binary.getTag() == JCTree.Tag.EQ || binary.getTag() == JCTree.Tag.NE) {
+                boolean lhsNull = (binary.lhs instanceof JCTree.JCLiteral l)
+                        && l.typetag == TypeTag.BOT;
+                boolean rhsNull = (binary.rhs instanceof JCTree.JCLiteral l)
+                        && l.typetag == TypeTag.BOT;
+                if (lhsNull || rhsNull) {
+                    SourceRange sr = toSourceRange(binary);
+                    // x == null -> false; x != null -> true.
+                    return literalBool(sr, binary.getTag() == JCTree.Tag.NE);
+                }
+            }
             StmtExpr lhs = convertExpression(binary.lhs, renames);
             StmtExpr rhs = convertExpression(binary.rhs, renames);
             SourceRange sr = toSourceRange(binary);
