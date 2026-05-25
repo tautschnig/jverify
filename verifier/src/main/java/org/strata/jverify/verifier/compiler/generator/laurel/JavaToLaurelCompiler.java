@@ -72,7 +72,19 @@ public class JavaToLaurelCompiler {
         FilesMap filesMap = (uri, offset) -> {
             var lineMap = lineMaps.get(uri);
             if (lineMap == null) {
-                throw new RuntimeException("Could not find line map for " + uri);
+                // Strata sometimes reports diagnostics at a
+                // synthesized "<unknown>" URI when the offending
+                // tree was injected by a simplification pass
+                // (e.g. ArrayCompiler's lowering of an
+                // initializer-list array). Rather than throwing —
+                // which masks the real Strata error in the user's
+                // verdict — return a 1:1 fallback Position so the
+                // diagnostic threads through and surfaces as a
+                // user-visible Verifier error with a stable line
+                // location. The URI itself is still reported, so
+                // a developer inspecting raw_stderr can see the
+                // synthetic origin.
+                return new Position(1, 1);
             }
             long line = lineMap.getLineNumber(offset);
             long lineStart = lineMap.getStartPosition(line);
@@ -121,6 +133,20 @@ public class JavaToLaurelCompiler {
             List.of(parameter("arr", arrayMap),
                     parameter("idx", intType())),
             Optional.of(returnType(intType())),
+            Optional.empty(), List.of(), Optional.empty(),
+            List.of(), List.of(), Optional.empty()
+        )));
+        // arrayNew_1(N) returns a fresh Map<int,int> for a 1-D
+        // `new int[N]` allocation. This is the form ArrayCompiler
+        // emits for both `new int[N]` and `{v0, v1, ...}` literals
+        // (the latter loses the literal element values, retaining
+        // only the length). Strata sees an uninterpreted same-input
+        // -> same-output function. Multi-dimensional and richer
+        // arities can be added on demand.
+        commands.add(procedureCommand(function(
+            "arrayNew_1",
+            List.of(parameter("d0", intType())),
+            Optional.of(returnType(arrayMap)),
             Optional.empty(), List.of(), Optional.empty(),
             List.of(), List.of(), Optional.empty()
         )));
@@ -628,9 +654,30 @@ public class JavaToLaurelCompiler {
                     String ownerName = methodSym.owner != null
                             ? methodSym.owner.getQualifiedName().toString()
                             : "";
-                    if (ownerName.equals("org.strata.jverify.builtin.JArray")) {
+                    // Match either the qualified-name form
+                    // (org.strata.jverify.builtin.JArray) or its
+                    // post-MoveStaticMethodsToStaticType form
+                    // (org.strata.jverify.builtin.JArray?static).
+                    // The `?static` suffix is appended by the
+                    // simplification that hoists static methods to
+                    // a synthetic static-type, which runs after
+                    // ArrayCompiler.
+                    String ownerStem = ownerName.endsWith("?static")
+                        ? ownerName.substring(0, ownerName.length() - "?static".length())
+                        : ownerName;
+                    boolean isJArray =
+                        ownerStem.equals("org.strata.jverify.builtin.JArray")
+                        || ownerStem.endsWith(".JArray");
+                    if (isJArray) {
                         if (simpleName.equals("get")) {
                             calleeName = "arrayGet";
+                        } else if (simpleName.equals("create")) {
+                            // ArrayCompiler lowers `new int[N]` and
+                            // `{v0, ...}` to JArray.create(N). We
+                            // rewrite to arrayNew_1 (declared in
+                            // the prelude) so Strata's resolver
+                            // picks it up.
+                            calleeName = "arrayNew_1";
                         }
                     }
                     List<StmtExpr> args = new ArrayList<>();
@@ -683,6 +730,36 @@ public class JavaToLaurelCompiler {
                         convertExpression(arg, renames);
                     }
                     yield new_(sr, name);
+                }
+                case JCTree.JCNewArray newArray -> {
+                    // Two source forms reach here:
+                    //   `new int[N]`  — dims=[N], elems=null
+                    //   `{v0, v1, ...}` (or `new int[]{v0, ...}`)
+                    //                 — dims=[], elems=[v0, ...]
+                    // Both translate to a call into one of the
+                    // arrayNew_N / arrayInit_N uninterpreted
+                    // functions declared in the prelude (see
+                    // getPredefinedTypes for arities 0..3 wired
+                    // through; longer arrays surface as a
+                    // resolution error and can be added on
+                    // demand).
+                    SourceRange sr = toSourceRange(newArray);
+                    if (newArray.elems != null) {
+                        // Initializer-list form `{v0, v1, ...}`.
+                        List<StmtExpr> args = new ArrayList<>();
+                        for (var e : newArray.elems) {
+                            args.add(convertExpression(e, renames));
+                        }
+                        String fn = "arrayInit_" + args.size();
+                        yield call(sr, identifier(sr, fn), args);
+                    }
+                    // Sized form `new int[N]`.
+                    List<StmtExpr> dimArgs = new ArrayList<>();
+                    for (var d : newArray.dims) {
+                        dimArgs.add(convertExpression(d, renames));
+                    }
+                    String fn = "arrayNew_" + dimArgs.size();
+                    yield call(sr, identifier(sr, fn), dimArgs);
                 }
                 case JCTree.JCInstanceOf instanceOf -> {
                     // `r instanceof X`: in the opaque-CompositeType
