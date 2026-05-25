@@ -119,6 +119,32 @@ public class JavaToLaurelCompiler {
     }
 
     private LaurelType translateType(com.sun.tools.javac.code.Type type) {
+        // Array types: encoded as a Laurel MapType(int, elem). This is
+        // the standard Boogie/SMT array model and matches the JArray
+        // runtime model the ArrayCompiler simplification rewrites
+        // body-level `arr[i]` accesses to. With this translation, an
+        // `int[] xs` parameter becomes a Laurel `Map<int, int>`, which
+        // Strata can reason about via its map-theory axioms.
+        if (type instanceof com.sun.tools.javac.code.Type.ArrayType arrayType) {
+            return mapType(intType(), translateType(arrayType.elemtype));
+        }
+        // Class / interface types (including sealed hierarchies and
+        // records): encode as an opaque Laurel CompositeType named
+        // after the source-side type. Strata treats unbound composite
+        // types as uninterpreted reference sorts, which is enough
+        // for parameter-position acceptance (e.g.
+        // `static void leftIdentityNone(PathLengthRange r)`).
+        // Body-level operations on the value (instanceof, pattern
+        // match, record-component reads, constructors) need
+        // additional translation that is NOT part of this commit;
+        // they will surface as separate convertExpression errors.
+        if (type instanceof com.sun.tools.javac.code.Type.ClassType classType) {
+            String name = classType.tsym.getQualifiedName().toString();
+            // Strip the package and any nesting separator-dot to a
+            // dotted-form Laurel identifier. CompositeType is used
+            // as a hash-style sort name; we just need it stable.
+            return compositeType(name.replace('$', '.'));
+        }
         return switch (type.getTag()) {
             case INT -> compositeType("int32");
             case SHORT -> compositeType("int16");
@@ -537,6 +563,56 @@ public class JavaToLaurelCompiler {
                 // expression's type.
                 case JCTree.JCFieldAccess fa when fa.type.constValue() != null ->
                     convertConstantValue(toSourceRange(fa), fa.type.getTag(), fa.type.constValue());
+                case JCTree.JCNewClass newClass -> {
+                    // `new T(...)` for class / record types: produce
+                    // a Laurel `new_(T)` value of the matching
+                    // CompositeType. Constructor arguments are NOT
+                    // captured into the resulting value yet — that
+                    // would need a Laurel datatype declaration with
+                    // constructor args matching the source. For
+                    // verification of identity-style properties
+                    // that compare references (e.g. `cover(None, r)
+                    // == r`) the opaque value is sufficient. Body-
+                    // level inspection of record components will
+                    // still error until the datatype encoding
+                    // lands.
+                    SourceRange sr = toSourceRange(newClass);
+                    String name = newClass.type.tsym
+                            .getQualifiedName().toString()
+                            .replace('$', '.');
+                    // Evaluate args for type-checking side effect;
+                    // they're discarded in the opaque encoding.
+                    for (var arg : newClass.args) {
+                        convertExpression(arg, renames);
+                    }
+                    yield new_(sr, name);
+                }
+                case JCTree.JCInstanceOf instanceOf -> {
+                    // `r instanceof X`: in the opaque-CompositeType
+                    // encoding we don't have a tag, so we can't
+                    // express the test precisely. Emit a call to a
+                    // bool-valued uninterpreted predicate
+                    // `instanceOf_<X>(r)`. Strata treats unbound
+                    // function symbols as uninterpreted but
+                    // requires a declaration; without one,
+                    // verification will surface a 'Resolution
+                    // failed: instanceOf_<X>' error. Honest
+                    // marker for the records-and-sealed-types
+                    // gap.
+                    SourceRange sr = toSourceRange(instanceOf);
+                    StmtExpr lhs = convertExpression(instanceOf.expr, renames);
+                    // JCInstanceOf in Java 25 has `pattern` (a
+                    // JCTree); for the simple `r instanceof X` case
+                    // it's a JCIdent / type tree whose .type carries
+                    // the target class. For pattern-binding cases
+                    // (`r instanceof X x`), .type is still set on
+                    // the pattern's type-tree.
+                    var targetType = instanceOf.pattern.type;
+                    String typeName = targetType.tsym
+                            .getSimpleName().toString();
+                    yield call(sr, identifier(sr, "instanceOf_" + typeName),
+                            java.util.List.of(lhs));
+                }
                 default -> throw new JavaViolationException("Unsupported expression: " + expr.getClass().getSimpleName());
             };
         }
